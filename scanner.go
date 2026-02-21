@@ -12,11 +12,11 @@ import (
 )
 
 const (
-	workers    = 10
-	ratePerSec = 12 // conservative — helps avoid DNS softblock
-	timeout    = 4 * time.Second
-	retryDelay = 2 * time.Second // wait before retrying after a suspected softblock
-	retryMax   = 2               // max retries per IP on timeout
+	workers    = 15
+	ratePerSec = 20 // IPs per second, not port probes per second
+	timeout    = 3 * time.Second
+	retryDelay = 1500 * time.Millisecond
+	retryMax   = 1
 )
 
 var ports = []string{"80", "443", "8080"}
@@ -57,56 +57,55 @@ type PortResult struct {
 	timedOut bool
 }
 
-// probePort attempts a TCP dial and classifies the result
 func probePort(ip, port string) PortResult {
-	conn, err := net.DialTimeout("tcp", ip+":"+port, timeout)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
 	if err == nil {
 		conn.Close()
-		return PortResult{port: port, alive: true, timedOut: false}
+		return PortResult{port: port, alive: true}
 	}
 
-	errStr := err.Error()
-
-	// connection refused = host is alive, just no service on this port
-	if strings.Contains(errStr, "connection refused") {
-		return PortResult{port: port, alive: true, timedOut: false}
+	e := err.Error()
+	if strings.Contains(e, "connection refused") {
+		return PortResult{port: port, alive: true}
 	}
-
-	// i/o timeout or context deadline = possible softblock or truly dead
-	if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline") {
+	if strings.Contains(e, "timeout") || strings.Contains(e, "deadline") {
 		return PortResult{port: port, alive: false, timedOut: true}
 	}
-
-	return PortResult{port: port, alive: false, timedOut: false}
+	return PortResult{port: port, alive: false}
 }
 
 type ScanResult struct {
 	ip          string
 	openPorts   []string
-	allTimedOut bool // true if every port timed out — softblock signal
+	allTimedOut bool
 }
 
-// scanIP probes all 3 ports, with retry logic on full-timeout results
+// scanIP probes all ports CONCURRENTLY then decides on retry
 func scanIP(ip string) ScanResult {
-	result := ScanResult{ip: ip}
-
 	for attempt := 0; attempt <= retryMax; attempt++ {
 		if attempt > 0 {
-			// all ports timed out on previous attempt — likely softblock, back off
-			fmt.Printf("[!] Soft-block suspected on %s, backing off %v (attempt %d/%d)\n",
-				ip, retryDelay, attempt, retryMax)
 			time.Sleep(retryDelay)
 		}
 
+		results := make([]PortResult, len(ports))
+		var wg sync.WaitGroup
+
+		for i, port := range ports {
+			wg.Add(1)
+			go func(idx int, p string) {
+				defer wg.Done()
+				results[idx] = probePort(ip, p)
+			}(i, port)
+		}
+		wg.Wait()
+
 		var openPorts []string
 		timeoutCount := 0
-
-		for _, port := range ports {
-			res := probePort(ip, port)
-			if res.alive {
-				openPorts = append(openPorts, port)
+		for _, r := range results {
+			if r.alive {
+				openPorts = append(openPorts, r.port)
 			}
-			if res.timedOut {
+			if r.timedOut {
 				timeoutCount++
 			}
 		}
@@ -114,22 +113,15 @@ func scanIP(ip string) ScanResult {
 		allTimedOut := timeoutCount == len(ports)
 
 		if !allTimedOut || attempt == retryMax {
-			// got a real result, or exhausted retries
-			result.openPorts = openPorts
-			result.allTimedOut = allTimedOut && len(openPorts) == 0
-			return result
+			return ScanResult{
+				ip:          ip,
+				openPorts:   openPorts,
+				allTimedOut: allTimedOut && len(openPorts) == 0,
+			}
 		}
-		// all timed out and retries remain — loop and back off
 	}
 
-	return result
-}
-
-func formatPorts(ports []string) string {
-	if len(ports) == 0 {
-		return "none"
-	}
-	return strings.Join(ports, ", ")
+	return ScanResult{ip: ip, allTimedOut: true}
 }
 
 func main() {
@@ -147,7 +139,7 @@ func main() {
 	}
 
 	fmt.Printf("[*] Scanning ~%d hosts in %s\n", total, cidr)
-	fmt.Printf("[*] Workers: %d | Rate: %d req/s | Ports: %s\n\n",
+	fmt.Printf("[*] Workers: %d | Rate: %d IPs/s | Ports: %s\n\n",
 		workers, ratePerSec, strings.Join(ports, ", "))
 
 	timestamp := time.Now().Format("2006-01-02_15-04-05")
@@ -161,17 +153,15 @@ func main() {
 	writer := bufio.NewWriter(outFile)
 	defer writer.Flush()
 
-	fmt.Fprintf(writer, "# TCP scan of %s\n", cidr)
-	fmt.Fprintf(writer, "# Started: %s\n", timestamp)
-	fmt.Fprintf(writer, "# Ports tested: %s\n\n", strings.Join(ports, ", "))
-	fmt.Fprintf(writer, "%-18s %s\n", "IP", "Open Ports")
-	fmt.Fprintf(writer, "%s\n", strings.Repeat("-", 40))
+	fmt.Fprintf(writer, "# TCP scan of %s\n# Started: %s\n# Ports: %s\n\n",
+		cidr, timestamp, strings.Join(ports, ", "))
+	fmt.Fprintf(writer, "%-18s %s\n%s\n", "IP", "Open Ports", strings.Repeat("-", 40))
 
 	ticker := time.NewTicker(time.Second / ratePerSec)
 	defer ticker.Stop()
 
-	var wg sync.WaitGroup
 	var mu sync.Mutex
+	var wg sync.WaitGroup
 	found, scanned, softblocks := 0, 0, 0
 
 	for i := 0; i < workers; i++ {
@@ -179,26 +169,26 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for ip := range jobs {
-				<-ticker.C
+				<-ticker.C // one tick per IP — not per port probe
 				result := scanIP(ip)
 
 				mu.Lock()
 				scanned++
 
-				if result.allTimedOut {
+				switch {
+				case result.allTimedOut:
 					softblocks++
-					fmt.Printf("[~] %-16s  all ports timed out after retries (softblocks: %d)\n",
-						ip, softblocks)
-				} else if len(result.openPorts) > 0 {
+					fmt.Printf("[~] %-16s  timed out (softblocks: %d)\n", ip, softblocks)
+
+				case len(result.openPorts) > 0:
 					found++
-					portStr := formatPorts(result.openPorts)
-					fmt.Printf("[+] %-16s  ports: %-20s (%d found)\n",
-						ip, portStr, found)
+					portStr := strings.Join(result.openPorts, ", ")
+					fmt.Printf("[+] %-16s  ports: %-20s (%d found)\n", ip, portStr, found)
 					fmt.Fprintf(writer, "%-18s %s\n", ip, portStr)
 					writer.Flush()
 				}
 
-				if scanned%200 == 0 {
+				if scanned%100 == 0 {
 					fmt.Printf("    progress: %d/%d | found: %d | softblocks: %d\n",
 						scanned, total, found, softblocks)
 				}
@@ -209,8 +199,8 @@ func main() {
 
 	wg.Wait()
 
-	fmt.Fprintf(writer, "\n%s\n", strings.Repeat("-", 40))
-	fmt.Fprintf(writer, "# Done. %d responsive hosts | %d softblock events\n", found, softblocks)
-	fmt.Printf("\n[*] Done. %d/%d scanned | %d alive | %d softblock events → %s\n",
+	fmt.Fprintf(writer, "\n%s\n# Done. %d responsive | %d softblock events\n",
+		strings.Repeat("-", 40), found, softblocks)
+	fmt.Printf("\n[*] Done. %d/%d | %d alive | %d softblocks → %s\n",
 		scanned, total, found, softblocks, filename)
 }
